@@ -51,44 +51,33 @@ impl fmt::Display for LiveState {
     }
 }
 
+static FLAG_NAMES: &[(u32, &str)] = &[
+    (RflagsBits::OF, "OF"),
+    (RflagsBits::SF, "SF"),
+    (RflagsBits::ZF, "ZF"),
+    (RflagsBits::AF, "AF"),
+    (RflagsBits::CF, "CF"),
+    (RflagsBits::PF, "PF"),
+    (RflagsBits::DF, "DF"),
+    (RflagsBits::IF, "IF"),
+    (RflagsBits::AC, "AC"),
+    (RflagsBits::UIF, "UIF"),
+    (RflagsBits::C0, "C0"),
+    (RflagsBits::C1, "C1"),
+    (RflagsBits::C2, "C2"),
+    (RflagsBits::C3, "C3"),
+];
+
 impl LiveState {
     fn flagmask_str(flagmask: u32) -> String {
-        fn append(sb: &mut String, s: &str) {
-            if !sb.is_empty() {
-                sb.push(' ');
-            }
-            sb.push_str(s);
-        }
         let mut sb = String::new();
-        if (flagmask & RflagsBits::OF) != 0 {
-            append(&mut sb, "OF");
-        }
-        if (flagmask & RflagsBits::SF) != 0 {
-            append(&mut sb, "SF");
-        }
-        if (flagmask & RflagsBits::ZF) != 0 {
-            append(&mut sb, "ZF");
-        }
-        if (flagmask & RflagsBits::AF) != 0 {
-            append(&mut sb, "AF");
-        }
-        if (flagmask & RflagsBits::CF) != 0 {
-            append(&mut sb, "CF");
-        }
-        if (flagmask & RflagsBits::PF) != 0 {
-            append(&mut sb, "PF");
-        }
-        if (flagmask & RflagsBits::DF) != 0 {
-            append(&mut sb, "DF");
-        }
-        if (flagmask & RflagsBits::IF) != 0 {
-            append(&mut sb, "IF");
-        }
-        if (flagmask & RflagsBits::AC) != 0 {
-            append(&mut sb, "AC");
-        }
-        if (flagmask & RflagsBits::UIF) != 0 {
-            append(&mut sb, "UIF");
+        for (flag, name) in FLAG_NAMES {
+            if (flagmask & flag) != 0 {
+                if !sb.is_empty() {
+                    sb.push(' ');
+                }
+                sb.push_str(name);
+            }
         }
         sb
     }
@@ -391,31 +380,53 @@ impl fmt::Display for BasicBlock {
 
 impl BasicBlock {
     fn ghetto_serialize_liveness(&self) -> String {
+        fn live_state_json(state: &LiveState) -> String {
+            let mut sb = String::new();
+            sb.push_str("{\"regs\": [");
+            for (i, reg) in state.live_regs.iter().enumerate() {
+                if i > 0 {
+                    sb.push_str(", ");
+                }
+                sb.push_str(&format!("\"{reg:?}\""));
+            }
+            sb.push_str("], \"flags\": [");
+            let mut first = true;
+            for (mask, name) in FLAG_NAMES.iter() {
+                if (state.live_flags & mask) != 0 {
+                    if first {
+                        first = false;
+                    } else {
+                        sb.push_str(", ");
+                    }
+                    sb.push_str(&format!("\"{name}\""));
+                }
+            }
+            sb.push_str("]}");
+            sb
+        }
+
         let mut str = "".to_owned();
         str.push_str(&format!("\"{:#01x}\": {{", self.label));
         str.push('\n');
 
-        str.push_str(&format!("\"Liveness in\" : \"{}\",", self.live_in.to_string()));
+        str.push_str(&format!("\"Liveness in\" : {},", live_state_json(&self.live_in)));
         str.push('\n');
 
-        str.push_str(&format!("\"Liveness out\" : \"{}\",", self.live_out.to_string()));
+        str.push_str(&format!("\"Liveness out\" : {},", live_state_json(&self.live_out)));
         str.push('\n');
 
         str.push_str("\"Instr Liveness\" : {");
         str.push('\n');
 
-        for (label, liveness) in &self.liveness_map {
-            str.push_str(&format!("\"{:#01x}\" : \"{}\"", label, liveness));
-            if label != self.liveness_map.iter().last().unwrap().0 {
-                str.push(',');
+        for (i, (label, liveness)) in self.liveness_map.iter().enumerate() {
+            if i > 0 {
+                str.push_str(",\n");
             }
-            str.push('\n');
+            str.push_str(&format!("\"{:#01x}\" : {}", label, live_state_json(&liveness)));
         }
-
 
         str.push('}');
         str.push('\n');
-
 
         str.push_str("}");
         str.push('\n');
