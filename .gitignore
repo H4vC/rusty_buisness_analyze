@@ -5,3 +5,6 @@ target/
 Cargo.lock
 *.pdb
 .vscode/
+/dotgraph.dot
+/out.json
+/out.bin
