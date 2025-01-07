@@ -12,7 +12,7 @@ use itertools::Itertools;
 use petgraph::dot::Dot;
 use petgraph::Graph;
 use petgraph::graph::NodeIndex;
-use rand::{prelude::*, random, Rng};
+use rand::{prelude::*, random, Rng, thread_rng};
 use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
 
 use crate::tools::{BasicBlockVecExt, SplitThisMut};
@@ -162,7 +162,8 @@ impl AnalysisTarget {
         let instructions = self.disassemble();
 
         let mut code_analysis = CodeAnalysis { instructions: instructions.clone(), blocks: Vec::new(), c_flow_graph: Graph::new() };
-        code_analysis.add_blocks().unwrap();
+        code_analysis.split_blocks().expect("Failed to split code into blocks");
+        code_analysis.liveness_pass().expect("Failed to analyze liveness");
         code_analysis.make_graph();
 
         assert_eq!(code_analysis.instructions.len(), code_analysis.blocks.get_instruction_count());
@@ -171,12 +172,12 @@ impl AnalysisTarget {
     }
 }
 impl CodeAnalysis {
-    fn add_blocks(&mut self) -> Result<()> {
+    fn split_blocks(&mut self) -> Result<()> {
         if self.instructions.is_empty() { return Err(anyhow!("Instruction List empty")); }
 
         //Break Function into basic blocks
         let mut block_starts = HashSet::new();
-        block_starts.insert(self.instructions.first().unwrap().ip());
+        block_starts.insert(self.instructions.first().expect("No first block in block splitting pass").ip());
 
         for inst in &self.instructions {
             if inst.flow_control() != FlowControl::Next {
@@ -190,7 +191,7 @@ impl CodeAnalysis {
             let instructions: Vec<_> = self.instructions.iter().skip_while(|&instr| &instr.ip() != bs).take_while(|inst|
             (&inst.ip() == bs) || !block_starts.contains(&inst.ip())).copied().collect();
 
-            let post_blocks = instructions.last().unwrap().get_possible_flows();
+            let post_blocks = instructions.last().expect("No possible flow").get_possible_flows();
 
             self.blocks.push(BasicBlock { label: *bs, instructions, post_blocks, pre_blocks: Vec::new(), live_in: LiveState::default(), live_out: LiveState::default(), liveness_map: HashMap::new() });
         }
@@ -202,22 +203,25 @@ impl CodeAnalysis {
             bb.pre_blocks = pre_blocks;
         }
 
+        Ok(())
+    }
+
+    fn liveness_pass(&mut self) -> Result<()> {
         let mut block_queue = VecDeque::new();
         block_queue.extend(self.blocks.iter().filter(|b| b.instructions.iter().any(|i| i.flow_control() == FlowControl::Return)).map(|b| b.label)); //returning blocks
-        while !block_queue.is_empty() {
-            let label = block_queue.pop_front().unwrap();
 
-            let block = self.blocks.get_with_label_as_mut(label).unwrap();
+        while let Some(label) = block_queue.pop_front() {
+            let block = self.blocks.get_with_label_as_mut(label).expect("Failed to retrieve first block");
             let mut info_factory = InstructionInfoFactory::new();
 
-            let mut l_current = block.live_out.clone();
+            let mut live_info = block.live_out.clone();
 
-            for inst in block.instructions.iter().rev() {
+            for inst in block.instructions.iter().rev() { //iterate in reverse
                 let used_regs = info_factory.info(inst).used_registers();
                 let mut regs_read = used_regs.iter().filter(|&r| matches!(r.access(), OpAccess::Read | OpAccess::CondRead | OpAccess::ReadWrite | OpAccess::ReadCondWrite)).map(|r| r.register().full_register()).filter(|r| !r.is_segment_register()).collect(); //Mark Reads as Full Regs
                 let mut regs_wrote = used_regs.iter().filter(|&r| matches!(r.access(), OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite)).map(iced_x86::UsedRegister::register).collect();
 
-                match inst.flow_control() {
+                match inst.flow_control() { //calling convention
                     FlowControl::Return => {
                         regs_read = vec![Register::R12, Register::R13, Register::R14, Register::R15, Register::RDI, Register::RSI, Register::RBX, Register::RBP, Register::RSP, Register::RAX]; //Non volatile registers r-12->15 di si bx bp sp + RAX
                         regs_wrote = vec![];
@@ -230,38 +234,43 @@ impl CodeAnalysis {
                 }
 
                 if inst.rflags_read() != RflagsBits::NONE {
-                    l_current.live_flags |= inst.rflags_read();
+                    live_info.live_flags |= inst.rflags_read();
                 }
                 if !regs_read.is_empty() {
-                    l_current.live_regs.extend(regs_read.clone());
+                    live_info.live_regs.extend(regs_read.clone());
                 }
 
-                block.liveness_map.insert(inst.ip(), l_current.clone());
+                block.liveness_map.insert(inst.ip(), live_info.clone());
 
                 if inst.rflags_modified() != RflagsBits::NONE {
-                    l_current.live_flags &= !(inst.rflags_modified() & !inst.rflags_read());
+                    live_info.live_flags &= !(inst.rflags_modified() & !inst.rflags_read());
                 }
+
                 if !regs_wrote.is_empty() {
                     let mut only_written: HashSet<Register> = HashSet::new();
                     only_written.extend(regs_wrote.iter().filter(|r| !regs_read.contains(r)));
-                    l_current.live_regs = l_current.live_regs.clone().into_iter().filter(|r| !only_written.contains(r)).collect();
+                    live_info.live_regs = live_info.live_regs.clone().into_iter().filter(|r| !only_written.contains(r)).collect();
                 }
             }
 
-            if l_current != block.live_in {
-                block.live_in = l_current.clone();
-                for pred_label in &block.pre_blocks.clone() {
-                    let p_block = self.blocks.get_with_label_as_mut(*pred_label).unwrap();
-                    let mut extended_live_out = p_block.live_out.clone();
+            if live_info != block.live_in {
+                block.live_in = live_info.clone();
 
-                    extended_live_out.live_flags |= l_current.live_flags;
-                    extended_live_out.live_regs.extend(l_current.live_regs.clone());
+                for predecessor_label in &block.pre_blocks.clone() {
+                    if let Some(predecessor_block) = self.blocks.get_with_label_as_mut(*predecessor_label) {
+                        let mut extended_live_out = predecessor_block.live_out.clone();
+                        extended_live_out.live_flags |= live_info.live_flags;
+                        extended_live_out.live_regs.extend(live_info.live_regs.iter().cloned());
 
-                    p_block.live_out = extended_live_out;
-                    block_queue.push_front(*pred_label);
+                        predecessor_block.live_out = extended_live_out;
+                        block_queue.push_front(*predecessor_label);
+                    } else {
+                        eprintln!("Error: Predecessor block {:#01x} not found", predecessor_label);
+                    }
                 }
             }
         }
+
         Ok(())
     }
     fn make_graph(&mut self) {
